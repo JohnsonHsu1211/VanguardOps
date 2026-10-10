@@ -49,9 +49,9 @@ pub fn render_help(f: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![
-            Span::styled("  1 - 5        : ", Style::default().fg(Color::Yellow)),
+            Span::styled("  1 - 6        : ", Style::default().fg(Color::Yellow)),
             Span::raw(
-                "Direct switch between main tabs (Dashboard, Inventory, Details, Interfaces, Alerts)",
+                "Direct switch between main tabs (Dashboard, Inventory, Details, Interfaces, Alerts, Ansible)",
             ),
         ]),
         Line::from(vec![
@@ -137,6 +137,29 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  b / Esc      : ", Style::default().fg(Color::Yellow)),
             Span::raw("Return to Switch Details view"),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "--- ANSIBLE & AUDIT WORKFLOW ---",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled("  ↑ / ↓ (j / k): ", Style::default().fg(Color::Yellow)),
+            Span::raw("Navigate historical automation jobs"),
+        ]),
+        Line::from(vec![
+            Span::styled("  d            : ", Style::default().fg(Color::Yellow)),
+            Span::raw("Execute pre-flight Dry-Run verification (--check --diff)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  a            : ", Style::default().fg(Color::Yellow)),
+            Span::raw("Authorize & approve pending staged change request"),
+        ]),
+        Line::from(vec![
+            Span::styled("  w            : ", Style::default().fg(Color::Yellow)),
+            Span::raw("Test safety policy gate (verifies write protection lock)"),
         ]),
     ];
 

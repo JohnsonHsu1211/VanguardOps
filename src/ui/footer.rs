@@ -54,13 +54,16 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     // Right: Keybinding guide
     let keys_text = match app.active_tab {
-        Tab::Dashboard => " [1-5] Tabs  [/] Search  [e] Mock Err  [r] Reset  [?] Help  [q] Quit",
+        Tab::Dashboard => " [1-6] Tabs  [/] Search  [e] Mock Err  [r] Reset  [?] Help  [q] Quit",
         Tab::Inventory => " [↑/↓] Select  [Enter/Space] Expand  [f] Filter  [i] Ports  [?] Help",
         Tab::SwitchDetail => {
             " [i] Ports  [s] Sync Cisco SSH  [p] Ping  [b] Back  [/] Search  [?] Help"
         }
         Tab::Interfaces => " [↑/↓] Row  [Enter] Detail  [s/S] Sort  [f] Filter  [b] Back  [?] Help",
-        Tab::Alerts => " [↑/↓] Scroll  [1-4] Tabs  [/] Search  [r] Refresh  [?] Help",
+        Tab::Alerts => " [↑/↓] Scroll  [1-6] Tabs  [/] Search  [r] Refresh  [?] Help",
+        Tab::AnsibleJobs => {
+            " [↑/↓] Job  [d] Dry-Run Check  [a] Approve Change  [w] Safety Test  [?] Help"
+        }
     };
 
     let right_line = Line::from(vec![Span::styled(

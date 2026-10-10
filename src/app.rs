@@ -8,15 +8,17 @@ pub enum Tab {
     SwitchDetail = 2,
     Interfaces = 3,
     Alerts = 4,
+    AnsibleJobs = 5,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Dashboard,
         Tab::Inventory,
         Tab::SwitchDetail,
         Tab::Interfaces,
         Tab::Alerts,
+        Tab::AnsibleJobs,
     ];
 
     pub fn title(&self) -> &'static str {
@@ -26,6 +28,7 @@ impl Tab {
             Tab::SwitchDetail => "3: Switch Details",
             Tab::Interfaces => "4: Interfaces",
             Tab::Alerts => "5: Alerts & Logs",
+            Tab::AnsibleJobs => "6: Ansible & Audit",
         }
     }
 }
@@ -189,6 +192,10 @@ pub struct App {
 
     // Cisco Provider (Milestone 2)
     pub cisco_provider: std::sync::Arc<crate::provider::cisco::CiscoSwitchProvider>,
+
+    // Ansible Adapter (Milestone 3)
+    pub ansible: std::sync::Arc<crate::ansible::AnsibleAdapter>,
+    pub selected_audit_idx: usize,
 }
 
 impl App {
@@ -206,6 +213,17 @@ impl App {
         let cisco_provider = std::sync::Arc::new(crate::provider::cisco::CiscoSwitchProvider::new(
             transport, limiter,
         ));
+
+        let ansible = std::sync::Arc::new(crate::ansible::AnsibleAdapter::new_mock(
+            "/etc/idf/playbooks",
+        ));
+        // Initialize with initial baseline dry-run audit record
+        let init_req = crate::ansible::JobRequest::dry_run(
+            "backup_cisco_config.yml",
+            crate::ansible::TargetSelection::Single("sw-idf1a-01.hq.net".to_string()),
+            "system_audit",
+        );
+        let _ = ansible.submit_job(init_req, &net);
 
         let mut app = Self {
             net,
@@ -233,6 +251,8 @@ impl App {
             }),
             dashboard_alert_cursor: 0,
             cisco_provider,
+            ansible,
+            selected_audit_idx: 0,
         };
 
         // Select the first valid switch if available
@@ -509,6 +529,10 @@ impl App {
                 self.active_tab = Tab::Alerts;
                 return;
             }
+            KeyCode::Char('6') => {
+                self.active_tab = Tab::AnsibleJobs;
+                return;
+            }
             _ => {}
         }
 
@@ -519,6 +543,7 @@ impl App {
             Tab::SwitchDetail => self.handle_switch_detail_key(key),
             Tab::Interfaces => self.handle_interfaces_key(key),
             Tab::Alerts => self.handle_alerts_key(key),
+            Tab::AnsibleJobs => self.handle_ansible_jobs_key(key),
         }
     }
 
@@ -789,6 +814,123 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.dashboard_alert_cursor > 0 {
                     self.dashboard_alert_cursor -= 1;
+                }
+            }
+            KeyCode::Esc => {
+                self.active_tab = Tab::Dashboard;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_ansible_jobs_key(&mut self, key: KeyEvent) {
+        let entries = self.ansible.audit_trail.all_entries();
+        let total = entries.len();
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if total > 0 && self.selected_audit_idx + 1 < total {
+                    self.selected_audit_idx += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.selected_audit_idx > 0 {
+                    self.selected_audit_idx -= 1;
+                }
+            }
+            KeyCode::Char('d') => {
+                let host = self
+                    .current_switch()
+                    .map(|s| s.hostname.clone())
+                    .unwrap_or_else(|| "sw-idf1a-01.hq.net".to_string());
+                let req = crate::ansible::JobRequest::dry_run(
+                    "verify_interfaces.yml",
+                    crate::ansible::TargetSelection::Single(host.clone()),
+                    "operator",
+                );
+                match self.ansible.submit_job(req, &self.net) {
+                    Ok(entry) => {
+                        self.notification = Some(Notification {
+                            message: format!(
+                                "Dry-run check completed for {host} (Job {})",
+                                entry.job_id
+                            ),
+                            level: NotificationLevel::Success,
+                        });
+                        self.selected_audit_idx = self.ansible.audit_trail.len().saturating_sub(1);
+                    }
+                    Err(e) => {
+                        self.notification = Some(Notification {
+                            message: format!("Dry-run failed: {e}"),
+                            level: NotificationLevel::Error,
+                        });
+                    }
+                }
+            }
+            KeyCode::Char('a') => {
+                if let Some(entry) = entries.get(self.selected_audit_idx) {
+                    if entry.state == crate::ansible::JobState::AwaitingApproval {
+                        match self.ansible.approve_and_execute_job(
+                            &entry.job_id,
+                            "lead_engineer",
+                            "Approved during scheduled maintenance window",
+                            &self.net,
+                        ) {
+                            Ok(res) => {
+                                self.notification = Some(Notification {
+                                    message: format!(
+                                        "Job {} approved and executed successfully",
+                                        res.job_id
+                                    ),
+                                    level: NotificationLevel::Success,
+                                });
+                            }
+                            Err(e) => {
+                                self.notification = Some(Notification {
+                                    message: format!("Approval failed: {e}"),
+                                    level: NotificationLevel::Error,
+                                });
+                            }
+                        }
+                    } else {
+                        self.notification = Some(Notification {
+                            message: format!(
+                                "Job {} is not awaiting approval ({:?})",
+                                entry.job_id, entry.state
+                            ),
+                            level: NotificationLevel::Info,
+                        });
+                    }
+                }
+            }
+            KeyCode::Char('w') => {
+                let host = self
+                    .current_switch()
+                    .map(|s| s.hostname.clone())
+                    .unwrap_or_else(|| "sw-idf1a-01.hq.net".to_string());
+                let req = crate::ansible::JobRequest::live(
+                    "update_access_vlan.yml",
+                    crate::ansible::TargetSelection::Single(host),
+                    "operator",
+                    "Routine VLAN update",
+                );
+                match self.ansible.submit_job(req, &self.net) {
+                    Ok(entry) => {
+                        self.notification = Some(Notification {
+                            message: format!(
+                                "Staged write job {} (State: {:?})",
+                                entry.job_id, entry.state
+                            ),
+                            level: NotificationLevel::Warning,
+                        });
+                        self.selected_audit_idx = self.ansible.audit_trail.len().saturating_sub(1);
+                    }
+                    Err(e) => {
+                        self.notification = Some(Notification {
+                            message: format!("Write operation blocked by safety policy: {e}"),
+                            level: NotificationLevel::Warning,
+                        });
+                    }
                 }
             }
             KeyCode::Esc => {

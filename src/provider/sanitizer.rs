@@ -14,7 +14,7 @@ static CISCO_SECRET_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(community|token|passphrase|auth-key)\s+([^\s,;]+)").expect("valid regex")
+    Regex::new(r#"(?i)("?(?:password|secret|community|token|passphrase|ansible_password|auth-key)"?\s*(?::|=|\s+)\s*"?)([^",;\s\\\}]+)"?"#).expect("valid regex")
 });
 
 static CRYPT_HASH_REGEX: LazyLock<Regex> =
@@ -29,7 +29,7 @@ impl LogSanitizer {
     pub fn sanitize(input: &str) -> String {
         let step1 = PRIVATE_KEY_REGEX.replace_all(input, "[REDACTED PRIVATE KEY]");
         let step2 = CISCO_SECRET_REGEX.replace_all(&step1, "$1 [REDACTED]");
-        let step3 = SENSITIVE_KV_REGEX.replace_all(&step2, "$1 [REDACTED]");
+        let step3 = SENSITIVE_KV_REGEX.replace_all(&step2, "${1}[REDACTED]");
         let step4 = CRYPT_HASH_REGEX.replace_all(&step3, "[REDACTED HASH]");
         step4.into_owned()
     }

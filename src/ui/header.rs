@@ -45,7 +45,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" Navigation [Tab / 1-5] "),
+                .title(" Navigation [Tab / 1-6] "),
         )
         .select(app.active_tab as usize)
         .style(Style::default().fg(Color::DarkGray))

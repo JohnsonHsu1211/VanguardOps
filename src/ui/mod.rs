@@ -1,4 +1,5 @@
 pub mod alerts;
+pub mod ansible;
 pub mod dashboard;
 pub mod footer;
 pub mod header;
@@ -44,6 +45,7 @@ pub fn render_app(f: &mut Frame, app: &App) {
         Tab::SwitchDetail => switch_detail::render(f, app, main_chunks[1]),
         Tab::Interfaces => interfaces::render(f, app, main_chunks[1]),
         Tab::Alerts => alerts::render(f, app, main_chunks[1]),
+        Tab::AnsibleJobs => ansible::render(f, app, main_chunks[1]),
     }
 
     // 3. Footer

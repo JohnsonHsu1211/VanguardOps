@@ -651,3 +651,390 @@ fn test_app_sync_cisco_switch() {
     );
     assert!(non_cisco_notif.message.contains("is not Cisco IOS-XE"));
 }
+
+// =========================================================================
+// Milestone 3: Ansible Subprocess Adapter & Automation Integration Tests
+// =========================================================================
+
+use crate::ansible::approval::*;
+use crate::ansible::cmd::*;
+use crate::ansible::playbook::*;
+use crate::ansible::status::*;
+use crate::ansible::target::*;
+use crate::ansible::verification::*;
+use crate::ansible::*;
+use std::path::Path;
+
+#[test]
+fn test_ansible_target_validation() {
+    let net = generate_mock_infrastructure();
+
+    // 1. Valid single target
+    let sel_single = TargetSelection::Single("sw-idf1a-01.hq.net".to_string());
+    let val_single = TargetValidator::validate(&sel_single, &net, false).expect("validate single");
+    assert_eq!(val_single.count(), 1);
+    assert_eq!(val_single.limit_arg, "sw-idf1a-01.hq.net");
+
+    // 2. Valid rack target (rack-1a-01 has 2 switches)
+    let sel_rack = TargetSelection::Rack("rack-1a-01".to_string());
+    let val_rack = TargetValidator::validate(&sel_rack, &net, false).expect("validate rack");
+    assert_eq!(val_rack.count(), 2);
+    assert!(val_rack.limit_arg.contains("sw-idf1a-01.hq.net"));
+    assert!(val_rack.limit_arg.contains("sw-idf1a-02.hq.net"));
+
+    // 3. Valid closet target (closet-idf1a has 3 switches across 2 racks)
+    let sel_closet = TargetSelection::Closet("closet-idf1a".to_string());
+    let val_closet = TargetValidator::validate(&sel_closet, &net, false).expect("validate closet");
+    assert_eq!(val_closet.count(), 3);
+
+    // 4. Rejection of invalid characters (shell injection hazards)
+    let dangerous = [
+        "sw-01; rm -rf /",
+        "sw-01 & cat /etc/passwd",
+        "sw-01 | sh",
+        "sw-01`id`",
+        "sw-01$(whoami)",
+        "sw-01 > /tmp/out",
+        "sw-01\nsw-02",
+        "sw 01",
+    ];
+
+    for bad in dangerous {
+        assert!(
+            TargetValidator::validate_syntax(bad).is_err(),
+            "Expected '{bad}' to fail syntax validation"
+        );
+    }
+
+    // 5. Rejection of non-existent target
+    let sel_unknown = TargetSelection::Single("nonexistent-switch.hq.net".to_string());
+    match TargetValidator::validate(&sel_unknown, &net, false) {
+        Err(TargetValidationError::DeviceNotFound { target }) => {
+            assert_eq!(target, "nonexistent-switch.hq.net");
+        }
+        other => panic!("Expected DeviceNotFound, got {:?}", other),
+    }
+
+    // 6. Rejection of empty target list
+    let sel_empty = TargetSelection::Multiple(Vec::new());
+    assert_eq!(
+        TargetValidator::validate(&sel_empty, &net, false),
+        Err(TargetValidationError::EmptyTargets)
+    );
+}
+
+#[test]
+fn test_trusted_playbook_path_restrictions() {
+    let reg = PlaybookRegistry::with_default_catalog("/etc/idf/playbooks");
+
+    // 1. Valid approved playbook path resolution
+    let path = reg
+        .validate_path("backup_cisco_config.yml")
+        .expect("valid playbook");
+    assert_eq!(
+        path,
+        Path::new("/etc/idf/playbooks/backup_cisco_config.yml")
+    );
+
+    // 2. Directory traversal attempt rejection
+    let traversal = reg.validate_path("../../../etc/shadow.yml");
+    match traversal {
+        Err(PlaybookSecurityError::DirectoryTraversal { .. }) => {}
+        other => panic!("Expected DirectoryTraversal, got {:?}", other),
+    }
+
+    // 3. Invalid extension rejection (.sh instead of .yml/.yaml)
+    let invalid_ext = reg.validate_path("backup_cisco_config.sh");
+    match invalid_ext {
+        Err(PlaybookSecurityError::InvalidExtension { .. }) => {}
+        other => panic!("Expected InvalidExtension, got {:?}", other),
+    }
+
+    // 4. Unapproved playbook rejection
+    let unapproved = reg.validate_path("unapproved_arbitrary_task.yml");
+    match unapproved {
+        Err(PlaybookSecurityError::NotApproved { name }) => {
+            assert_eq!(name, "unapproved_arbitrary_task.yml");
+        }
+        other => panic!("Expected NotApproved, got {:?}", other),
+    }
+
+    // 5. Playbook classification (ReadOnly vs Write)
+    let ro_pb = reg.find_playbook("backup_cisco_config.yml").unwrap();
+    assert_eq!(ro_pb.playbook_type, PlaybookType::ReadOnly);
+    assert!(!ro_pb.playbook_type.is_write());
+
+    let write_pb = reg.find_playbook("update_access_vlan.yml").unwrap();
+    assert_eq!(write_pb.playbook_type, PlaybookType::Write);
+    assert!(write_pb.playbook_type.is_write());
+}
+
+#[test]
+fn test_ansible_command_builder_array_execution() {
+    let builder = AnsibleCommandBuilder::new(
+        "/etc/idf/playbooks/backup_cisco_config.yml",
+        "/etc/idf/inventory/hosts.ini",
+    )
+    .with_limit("sw-idf1a-01.hq.net")
+    .with_check_mode(true)
+    .with_diff_mode(true)
+    .with_extra_var("vlan_id", "20")
+    .with_extra_var("password", "SecretPassword999");
+
+    let args = builder.build_args();
+
+    assert!(args.contains(&"-i".to_string()));
+    assert!(args.contains(&"/etc/idf/inventory/hosts.ini".to_string()));
+    assert!(args.contains(&"--limit".to_string()));
+    assert!(args.contains(&"sw-idf1a-01.hq.net".to_string()));
+    assert!(args.contains(&"--check".to_string()));
+    assert!(args.contains(&"--diff".to_string()));
+    assert_eq!(
+        args.last().unwrap(),
+        "/etc/idf/playbooks/backup_cisco_config.yml"
+    );
+
+    let sanitized = builder.build_sanitized_display();
+    assert!(!sanitized.contains("SecretPassword999"));
+    assert!(sanitized.contains("[REDACTED]"));
+}
+
+#[test]
+fn test_dry_run_execution() {
+    let net = generate_mock_infrastructure();
+    let adapter = AnsibleAdapter::new_mock("/etc/idf/playbooks");
+
+    let req = JobRequest::dry_run(
+        "verify_interfaces.yml",
+        TargetSelection::Single("sw-idf1a-01.hq.net".to_string()),
+        "operator_dan",
+    );
+
+    let result = adapter.submit_job(req, &net).expect("dry run submit");
+    assert!(result.is_dry_run);
+    assert_eq!(result.state, JobState::Completed);
+    assert_eq!(result.exit_code, Some(0));
+    assert!(result.sanitized_command.contains("--check"));
+    assert!(result.sanitized_command.contains("--diff"));
+    assert_eq!(
+        result.verification.unwrap().status,
+        VerificationStatus::Skipped
+    );
+}
+
+#[test]
+fn test_approval_gate_and_write_protection_disabled_by_default() {
+    let net = generate_mock_infrastructure();
+    let adapter = AnsibleAdapter::new_mock("/etc/idf/playbooks");
+
+    // 1. By default, write operations must be locked
+    assert!(!adapter.approval_gate.policy.write_operations_enabled);
+
+    let write_req = JobRequest::live(
+        "update_access_vlan.yml",
+        TargetSelection::Single("sw-idf1a-01.hq.net".to_string()),
+        "operator_bob",
+        "VLAN change on access port",
+    );
+
+    // Live write submission must be rejected with WriteOperationsDisabled
+    let err = adapter.submit_job(write_req.clone(), &net).unwrap_err();
+    match err {
+        AnsibleError::Approval(ApprovalError::WriteOperationsDisabled) => {}
+        other => panic!("Expected WriteOperationsDisabled, got {:?}", other),
+    }
+
+    // 2. Enable write operations in policy and verify approval gate staging
+    let custom_gate = ApprovalGate::new(WriteProtectionPolicy {
+        write_operations_enabled: true,
+        require_two_person_rule: true,
+    });
+    let enabled_adapter = AnsibleAdapter::new(
+        Arc::new(MockSubprocessRunner::new()),
+        PlaybookRegistry::with_default_catalog("/etc/idf/playbooks"),
+        custom_gate.clone(),
+        Path::new("/etc/idf/inventory/hosts.ini"),
+        Duration::from_secs(60),
+    );
+
+    // Submission stages as AwaitingApproval
+    let staged = enabled_adapter
+        .submit_job(write_req, &net)
+        .expect("stage write job");
+    assert_eq!(staged.state, JobState::AwaitingApproval);
+
+    // 3. Two-person rule violation: operator cannot approve their own write job
+    let self_approve = enabled_adapter.approve_and_execute_job(
+        &staged.job_id,
+        "operator_bob", // same as operator
+        "Self sign-off",
+        &net,
+    );
+    match self_approve {
+        Err(AnsibleError::Approval(ApprovalError::TwoPersonRuleViolation { .. })) => {}
+        other => panic!("Expected TwoPersonRuleViolation, got {:?}", other),
+    }
+
+    // 4. Authorized peer approval executes the job
+    let approved = enabled_adapter
+        .approve_and_execute_job(
+            &staged.job_id,
+            "peer_lead_sarah", // distinct reviewer
+            "Approved change for maintenance window",
+            &net,
+        )
+        .expect("authorized execution");
+
+    assert_eq!(approved.state, JobState::Completed);
+    assert!(approved.approval_status.is_approved());
+}
+
+#[test]
+fn test_per_device_status_parsing() {
+    let ansible_output = r#"
+PLAY [Configure Access Switches] **********************************************
+TASK [Configure VLAN] *********************************************************
+changed: [sw-idf1a-01.hq.net]
+ok: [sw-idf1a-02.hq.net]
+fatal: [sw-idfwh-01.hq.net]: FAILED! => {"msg": "Connection timeout"}
+
+PLAY RECAP *********************************************************************
+sw-idf1a-01.hq.net         : ok=4    changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+sw-idf1a-02.hq.net         : ok=5    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+sw-idf2b-01.hq.net         : ok=0    changed=0    unreachable=1    failed=0    skipped=0    rescued=0    ignored=0
+sw-idfwh-01.hq.net         : ok=2    changed=0    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+"#;
+
+    let statuses = StatusParser::parse_play_recap(ansible_output);
+    assert_eq!(statuses.len(), 4);
+
+    let sw1 = statuses.get("sw-idf1a-01.hq.net").unwrap();
+    assert_eq!(sw1.state, DeviceExecutionState::Changed);
+    assert_eq!(sw1.changed_count, 1);
+    assert_eq!(sw1.ok_count, 4);
+
+    let sw2 = statuses.get("sw-idf1a-02.hq.net").unwrap();
+    assert_eq!(sw2.state, DeviceExecutionState::Ok);
+    assert_eq!(sw2.changed_count, 0);
+
+    let sw3 = statuses.get("sw-idf2b-01.hq.net").unwrap();
+    assert_eq!(sw3.state, DeviceExecutionState::Unreachable);
+    assert_eq!(sw3.unreachable_count, 1);
+
+    let sw4 = statuses.get("sw-idfwh-01.hq.net").unwrap();
+    assert_eq!(sw4.state, DeviceExecutionState::Failed);
+    assert_eq!(sw4.failed_count, 1);
+}
+
+#[test]
+fn test_post_change_verification() {
+    let net = generate_mock_infrastructure();
+    let sw = net.find_switch("sw-idf1a-01").unwrap();
+
+    let mut status_map = HashMap::new();
+    let mut dev_status = DeviceJobStatus::new("sw-idf1a-01.hq.net");
+    dev_status.state = DeviceExecutionState::Ok;
+    dev_status.ok_count = 3;
+    status_map.insert("sw-idf1a-01.hq.net".to_string(), dev_status);
+
+    // 1. Live change verification with normal switch
+    let report = PostChangeVerifier::verify(std::slice::from_ref(sw), &status_map, false);
+    // sw-idf1a-01 in mock data has 1 err-disabled port (BPDU guard), so interface health check produces Warning
+    assert_eq!(report.status, VerificationStatus::Warning);
+    assert!(!report.checks.is_empty());
+
+    // 2. Dry run skips verification
+    let dry_report = PostChangeVerifier::verify(std::slice::from_ref(sw), &status_map, true);
+    assert_eq!(dry_report.status, VerificationStatus::Skipped);
+}
+
+#[test]
+fn test_audit_history_and_secret_redaction() {
+    let net = generate_mock_infrastructure();
+    let adapter = AnsibleAdapter::new_mock("/etc/idf/playbooks");
+
+    let mut req = JobRequest::dry_run(
+        "backup_cisco_config.yml",
+        TargetSelection::Single("sw-idf1a-01.hq.net".to_string()),
+        "auditor_jen",
+    );
+    req.extra_vars.insert(
+        "ansible_password".to_string(),
+        "VaultSecretKey99".to_string(),
+    );
+
+    let entry = adapter.submit_job(req, &net).expect("submit job");
+
+    // 1. Audit trail persistence
+    let recorded = adapter
+        .audit_trail
+        .find_by_job_id(&entry.job_id)
+        .expect("find job");
+    assert_eq!(recorded.operator, "auditor_jen");
+    assert_eq!(recorded.playbook_id, "pb-backup-cisco");
+
+    // 2. Secret redaction in audit record
+    assert!(!recorded.sanitized_command.contains("VaultSecretKey99"));
+    assert!(recorded.sanitized_command.contains("[REDACTED]"));
+
+    // 3. Device query filter
+    let dev_entries = adapter.audit_trail.find_by_device("sw-idf1a-01.hq.net");
+    assert!(!dev_entries.is_empty());
+}
+
+#[test]
+fn test_ansible_timeout_handling() {
+    let net = generate_mock_infrastructure();
+    let mock_runner = Arc::new(MockSubprocessRunner::new());
+    mock_runner.set_timeout(Some(Duration::from_secs(30)));
+
+    let adapter = AnsibleAdapter::new(
+        mock_runner,
+        PlaybookRegistry::with_default_catalog("/etc/idf/playbooks"),
+        ApprovalGate::new(WriteProtectionPolicy::default()),
+        Path::new("/etc/idf/inventory/hosts.ini"),
+        Duration::from_secs(30),
+    );
+
+    let req = JobRequest::dry_run(
+        "verify_interfaces.yml",
+        TargetSelection::Single("sw-idf1a-01.hq.net".to_string()),
+        "operator",
+    );
+
+    let err = adapter.submit_job(req, &net).unwrap_err();
+    match err {
+        AnsibleError::Timeout { duration, .. } => {
+            assert_eq!(duration, Duration::from_secs(30));
+        }
+        other => panic!("Expected Timeout, got {:?}", other),
+    }
+
+    // Verify audit entry state is TimedOut
+    let entries = adapter.audit_trail.all_entries();
+    assert_eq!(entries.last().unwrap().state, JobState::TimedOut);
+}
+
+#[test]
+fn test_tui_ansible_jobs_tab_navigation() {
+    let net = generate_mock_infrastructure();
+    let mut app = App::new(net);
+
+    // 1. Direct switch to tab 6 (Ansible & Audit)
+    app.handle_key(make_key(KeyCode::Char('6')));
+    assert_eq!(app.active_tab, Tab::AnsibleJobs);
+
+    // 2. Trigger dry-run verification with 'd'
+    app.handle_key(make_key(KeyCode::Char('d')));
+    assert!(app.notification.is_some());
+    let notif = app.notification.clone().unwrap();
+    assert_eq!(notif.level, crate::app::NotificationLevel::Success);
+    assert!(notif.message.contains("Dry-run check completed"));
+
+    // 3. Test safety gate with 'w' (write locked by default)
+    app.handle_key(make_key(KeyCode::Char('w')));
+    assert!(app.notification.is_some());
+    let safety_notif = app.notification.clone().unwrap();
+    assert_eq!(safety_notif.level, crate::app::NotificationLevel::Warning);
+    assert!(safety_notif.message.contains("blocked by safety policy"));
+}

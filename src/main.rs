@@ -1,3 +1,4 @@
+pub mod ansible;
 pub mod app;
 pub mod mock;
 pub mod model;
